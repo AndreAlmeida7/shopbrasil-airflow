@@ -1,0 +1,130 @@
+# ShopBrasil - Airflow 2.10.5 com LocalExecutor
+# Baseado no docker-compose oficial do Airflow, enxugado (sem Celery/Redis/Flower).
+#
+# Serviços:
+#   postgres            -> banco de METADADOS do Airflow
+#   postgres-analytics  -> base ANALÍTICA onde o pipeline grava as métricas (porta 5433 no host)
+#   airflow-init        -> migra o metadados, cria usuário admin e o pool ecommerce_pool (2 slots)
+#   airflow-webserver   -> UI em http://localhost:8080
+#   airflow-scheduler   -> agenda e executa as tasks (LocalExecutor)
+
+x-airflow-common:
+  &airflow-common
+  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.10.5}
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: America/Sao_Paulo
+    AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE: America/Sao_Paulo
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    # Connection do Airflow para a base analítica (lida pelo PostgresHook via conn_id "postgres_analytics")
+    AIRFLOW_CONN_POSTGRES_ANALYTICS: postgresql://${ANALYTICS_DB_USER:-shopbrasil}:${ANALYTICS_DB_PASSWORD:-shopbrasil}@postgres-analytics:5432/${ANALYTICS_DB_NAME:-shopbrasil}
+    FAKESTORE_BASE_URL: ${FAKESTORE_BASE_URL:-https://fakestoreapi.com}
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./plugins:/opt/airflow/plugins
+    - ./logs:/opt/airflow/logs
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+    postgres-analytics:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  postgres-analytics:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${ANALYTICS_DB_USER:-shopbrasil}
+      POSTGRES_PASSWORD: ${ANALYTICS_DB_PASSWORD:-shopbrasil}
+      POSTGRES_DB: ${ANALYTICS_DB_NAME:-shopbrasil}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-analytics-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ANALYTICS_DB_USER:-shopbrasil} -d ${ANALYTICS_DB_NAME:-shopbrasil}"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        mkdir -p /sources/logs /sources/dags /sources/plugins
+        chown -R "${AIRFLOW_UID:-50000}:0" /sources/logs /sources/dags /sources/plugins || true
+        # Migra o banco de metadados e cria o usuário admin (variáveis _AIRFLOW_* abaixo)
+        /entrypoint airflow version
+        # Pool que limita a concorrência das tasks mapeadas por categoria
+        airflow pools set ecommerce_pool 2 "Limita a 2 o calculo simultaneo de metricas por categoria"
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+    user: "0:0"
+    volumes:
+      - .:/sources
+
+volumes:
+  postgres-db-volume:
+  postgres-analytics-volume:

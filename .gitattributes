@@ -1,0 +1,2 @@
+# Garante LF nos arquivos do projeto mesmo clonando no Windows (evita quebra dentro dos containers Linux)
+* text=auto eol=lf
